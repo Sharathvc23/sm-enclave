@@ -189,9 +189,9 @@ class TestCreateDefaultCommitter:
         committer = create_default_committer()
 
         for effect_type in EffectType:
-            assert (
-                effect_type in committer._committers
-            ), f"Missing committer for {effect_type}"
+            assert effect_type in committer._committers, (
+                f"Missing committer for {effect_type}"
+            )
 
     # --- Adversarial ---
 

@@ -345,7 +345,7 @@ class TestEnclave:
 
         import asyncio
 
-        asyncio.get_event_loop().run_until_complete(committer.commit(enclave))
+        asyncio.run(committer.commit(enclave))
         assert enclave.is_committed is True
 
         with pytest.raises(RuntimeError, match="sealed"):
@@ -363,7 +363,7 @@ class TestEnclave:
 
         import asyncio
 
-        asyncio.get_event_loop().run_until_complete(committer.discard(enclave))
+        asyncio.run(committer.discard(enclave))
         assert enclave.is_discarded is True
 
         with pytest.raises(RuntimeError, match="sealed"):
