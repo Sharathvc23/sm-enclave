@@ -284,13 +284,12 @@ class Enclave:
         """Internal method to stage any effect."""
         if self._sealed:
             raise RuntimeError(
-                f"Enclave {self._sandbox_id} is sealed, " "cannot stage new effects"
+                f"Enclave {self._sandbox_id} is sealed, cannot stage new effects"
             )
 
         if len(self._effects) >= self._max_effects:
             raise RuntimeError(
-                f"Enclave {self._sandbox_id} at capacity "
-                f"({self._max_effects} effects)"
+                f"Enclave {self._sandbox_id} at capacity ({self._max_effects} effects)"
             )
 
         effect = StagedEffect(
