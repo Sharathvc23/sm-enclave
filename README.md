@@ -5,9 +5,9 @@ Speculative execution sandbox with staged side effects and commit/discard semant
 ## What It Does
 
 - **Staged side effects** — Effects produced inside a speculative branch are held in an `Enclave` and never applied until the branch wins. Losing branches are discarded without touching external state.
-- **Six effect types** — Facts, messages, commands, metrics, events, and external API calls, each with its own reversibility default.
-- **Irreversibility gate** — Commands marked `irreversible=True` are blocked unless the enclave is explicitly configured with `allow_irreversible=True`. Prevents speculative branches from firing hardware actions, sending un-retractable messages, or triggering other actions that cannot be undone.
-- **Atomic commit with rollback** — Effects commit in priority order. If any effect fails, previously committed reversible effects roll back in reverse order.
+- **Six effect types** — Facts, messages, commands, metrics, events, and external API calls, each with its own reversibility default. `stage_external_api()` is the path for work that lands on someone else's system: a charge, a booking, a provisioning call.
+- **Irreversibility gate** — Any effect staged as irreversible is blocked unless the enclave is explicitly configured with `allow_irreversible=True`. The check lives in `_stage_effect`, so it covers every effect type: a hardware command, an un-retractable message, an emitted event, an outbound API call. Messages, events and external API calls are irreversible by default; pass `irreversible=False` to opt out.
+- **Commit with compensation, not rewind** — Effects commit in priority order. If any effect fails, effects already committed in that run are revisited in reverse order and their committer's `rollback` is called. For anything that left the process this is a *compensating* action — a refund, a cancellation — not an undo. An effect staged as irreversible is skipped: nothing is attempted and nothing pretends to have been. The flag therefore means "a committer can compensate this," not "the world can be rewound."
 - **Parallel execution** — `SpeculativeExecutor` runs multiple branches concurrently in isolated enclaves, then commits the winner and discards the losers.
 - **Pluggable committers** — An `EffectCommitter` Protocol lets callers attach their own commit logic per effect type. A logging committer is provided for testing.
 - **Zero dependencies** — Standard library only. Python 3.10+.
@@ -62,10 +62,40 @@ asyncio.run(main())
 |------|-----------------------|-----------------|-------------|
 | `COMMAND` | Configurable (safe: no) | 50 | Hardware or system commands |
 | `FACT` | Yes | 100 | Create or update facts |
-| `MESSAGE` | No | 200 | Outbound messages |
+| `MESSAGE` | Configurable (default: no) | 200 | Outbound messages |
 | `METRIC` | Yes | 300 | Metric updates |
-| `EVENT` | No | 400 | Event emissions |
-| `EXTERNAL_API` | No | 100 | External API calls |
+| `EVENT` | Configurable (default: no) | 400 | Event emissions |
+| `EXTERNAL_API` | Configurable (default: no) | 150 | Calls to an external service |
+
+`EXTERNAL_API` commits at 150 — after local facts (100) are durable, before messages (200)
+announce the result. Every type whose default is "no" is refused by a default enclave; build it
+with `allow_irreversible=True`, or pass `irreversible=False` at the call site when a committer is
+wired to compensate that specific effect.
+
+### Staging a call that leaves the process
+
+```python
+from sm_enclave import Enclave
+
+# A losing branch must never dispatch the charge, so it is staged, not called.
+enclave = Enclave(fork_id="fork:checkout", option_key="express")
+
+charge = enclave.stage_external_api(
+    "/v1/charges",
+    {"amount_cents": 2500, "currency": "usd"},
+    irreversible=False,  # the committer below can issue the refund
+    idempotency_key="idem:order-4417",
+)
+enclave.stage_message("ops@example.com", {"order": "4417"}, irreversible=False)
+
+# Nothing above has touched the network. The committer decides, later,
+# whether this branch won -- and on a failed commit calls rollback(), where
+# the refund lives.
+```
+
+Leave `irreversible` at its default when no committer can compensate the endpoint. The call is
+then refused by a default enclave, which is the honest outcome: an un-compensable charge does not
+belong in a speculative branch.
 
 ## Where It's Useful
 

@@ -153,18 +153,28 @@ class Enclave:
         payload: dict[str, Any],
         *,
         message_type: str = "generic",
+        irreversible: bool = True,
         priority: int = 200,
     ) -> str:
         """Stage a message.
+
+        A sent message cannot be unsent, so this is irreversible by default
+        and subject to the same gate as an irreversible command. Pass
+        ``irreversible=False`` only when the transport genuinely supports
+        retraction (an internal queue the committer can purge, for example).
 
         Args:
             recipient: Recipient identifier
             payload: Message payload
             message_type: Type of message
+            irreversible: Whether the send can be reversed
             priority: Commit priority
 
         Returns:
             Effect ID
+
+        Raises:
+            ValueError: If irreversible effects are not allowed
         """
         return self._stage_effect(
             effect_type=EffectType.MESSAGE,
@@ -173,8 +183,9 @@ class Enclave:
                 "message_type": message_type,
                 "data": payload,
             },
-            reversible=False,
+            reversible=not irreversible,
             priority=priority,
+            label=recipient,
         )
 
     def stage_command(
@@ -201,12 +212,6 @@ class Enclave:
         Raises:
             ValueError: If irreversible commands not allowed
         """
-        if irreversible and not self._allow_irreversible:
-            raise ValueError(
-                f"Irreversible command '{command_type}' blocked. "
-                "Set allow_irreversible=True to enable."
-            )
-
         return self._stage_effect(
             effect_type=EffectType.COMMAND,
             payload={
@@ -216,6 +221,7 @@ class Enclave:
             },
             reversible=not irreversible,
             priority=priority,
+            label=command_type,
         )
 
     def stage_metric(
@@ -250,17 +256,27 @@ class Enclave:
         event_type: str,
         payload: dict[str, Any],
         *,
+        irreversible: bool = True,
         priority: int = 400,
     ) -> str:
         """Stage an event emission.
 
+        An emitted event cannot be recalled from subscribers, so this is
+        irreversible by default and subject to the same gate as an
+        irreversible command. Pass ``irreversible=False`` when the committer
+        writes to a log it can truncate.
+
         Args:
             event_type: Event type
             payload: Event data
+            irreversible: Whether the emission can be reversed
             priority: Commit priority
 
         Returns:
             Effect ID
+
+        Raises:
+            ValueError: If irreversible effects are not allowed
         """
         return self._stage_effect(
             effect_type=EffectType.EVENT,
@@ -268,8 +284,78 @@ class Enclave:
                 "event_type": event_type,
                 "data": payload,
             },
-            reversible=False,
+            reversible=not irreversible,
             priority=priority,
+            label=event_type,
+        )
+
+    def stage_external_api(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "POST",
+        irreversible: bool = True,
+        idempotency_key: str | None = None,
+        target_id: str = "",
+        priority: int = 150,
+    ) -> str:
+        """Stage an outbound call to an external service.
+
+        This is the effect class for work that leaves the process and lands
+        on someone else's system -- a charge, a booking, a provisioning call.
+        Once dispatched, nothing here can rewind it. The most a caller can
+        arrange is a *compensating* action: a refund, a cancellation.
+
+        Which of the two you get is decided by ``irreversible``, because that
+        flag drives both the staging gate and
+        :meth:`~sm_enclave.committer.SideEffectCommitter._rollback_committed`:
+
+        * ``irreversible=True`` (the default) -- the gate refuses the effect
+          unless the enclave was built with ``allow_irreversible=True``, and
+          if it commits and a later effect then fails, **no compensation is
+          attempted**. The call stands.
+        * ``irreversible=False`` -- the caller asserts that the registered
+          committer's ``rollback`` can compensate this endpoint. The gate
+          permits it and compensation is attempted on a failed commit.
+
+        So pass ``irreversible=False`` only when a committer is wired to
+        issue the refund or cancellation. It does not mean the call is
+        harmless; it means someone has taken responsibility for undoing it.
+
+        ``idempotency_key`` is carried on the payload so a committer can
+        retry or compensate safely; the enclave only records it.
+
+        Commit priority defaults to 150 -- after local facts (100) are
+        durable, before messages (200) announce the result.
+
+        Args:
+            endpoint: Target endpoint or operation identifier
+            params: Request parameters
+            method: Request method or verb
+            irreversible: Whether a committer can compensate this call
+            idempotency_key: Caller-supplied key for safe retry
+            target_id: Target system identifier
+            priority: Commit priority
+
+        Returns:
+            Effect ID
+
+        Raises:
+            ValueError: If irreversible effects are not allowed
+        """
+        return self._stage_effect(
+            effect_type=EffectType.EXTERNAL_API,
+            payload={
+                "endpoint": endpoint,
+                "method": method,
+                "target_id": target_id,
+                "params": dict(params or {}),
+                "idempotency_key": idempotency_key,
+            },
+            reversible=not irreversible,
+            priority=priority,
+            label=f"{method} {endpoint}",
         )
 
     def _stage_effect(
@@ -280,8 +366,22 @@ class Enclave:
         reversible: bool,
         priority: int,
         dependencies: list[str] | None = None,
+        label: str = "",
     ) -> str:
-        """Internal method to stage any effect."""
+        """Internal method to stage any effect.
+
+        The irreversibility gate lives here rather than in each public
+        ``stage_*`` method, so every effect type is covered by it. It is
+        checked first, before the sealed and capacity checks, because an
+        irreversible effect on a default enclave is a policy error whatever
+        else is true of the enclave.
+        """
+        if not reversible and not self._allow_irreversible:
+            raise ValueError(
+                f"Irreversible {effect_type.value} '{label}' blocked. "
+                "Set allow_irreversible=True to enable."
+            )
+
         if self._sealed:
             raise RuntimeError(
                 f"Enclave {self._sandbox_id} is sealed, cannot stage new effects"

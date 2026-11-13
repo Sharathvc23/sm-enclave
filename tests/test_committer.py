@@ -177,7 +177,9 @@ class TestSideEffectCommitter:
         self, committer: SideEffectCommitter
     ) -> None:
         """Should skip effects without registered committer."""
-        enclave = Enclave(fork_id="fork:test", option_key="option")
+        enclave = Enclave(
+            fork_id="fork:test", option_key="option", allow_irreversible=True
+        )
         enclave.stage_event("event", {})  # No committer for EVENT
 
         result = await committer.commit(enclave)
@@ -343,7 +345,9 @@ class TestSideEffectCommitter:
     async def test_commit_with_no_registered_committer_skips(self) -> None:
         """Effect type with no registered committer -- should skip, not fail."""
         committer = SideEffectCommitter(effect_committers={})
-        enclave = Enclave(fork_id="fork:test", option_key="option")
+        enclave = Enclave(
+            fork_id="fork:test", option_key="option", allow_irreversible=True
+        )
         enclave.stage_event("some_event", {"data": "test"})
 
         result = await committer.commit(enclave)
@@ -377,7 +381,9 @@ class TestSideEffectCommitter:
                 EffectType.MESSAGE: FailOnSecondCommitter(),  # type: ignore[dict-item]
             }
         )
-        enclave = Enclave(fork_id="fork:test", option_key="option")
+        enclave = Enclave(
+            fork_id="fork:test", option_key="option", allow_irreversible=True
+        )
         # MESSAGE is reversible=False by default
         enclave.stage_message("recipient:1", {"cmd": "go"})
         enclave.stage_message("recipient:2", {"cmd": "fail"})
@@ -457,3 +463,144 @@ class TestSideEffectCommitter:
 
         assert result.success is False
         assert any("timeout" in reason.lower() for _, reason in result.failed_effects)
+
+
+class RecordingCommitter:
+    """Records commit and rollback calls; can be told which call to fail."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.fail_on = fail_on
+        self.committed: list[str] = []
+        self.rolled_back: list[str] = []
+
+    @staticmethod
+    def _label(effect: StagedEffect) -> str:
+        payload = effect.payload
+        return str(
+            payload.get("endpoint")
+            or payload.get("fact_type")
+            or payload.get("command_type")
+            or payload.get("recipient")
+            or payload.get("event_type")
+            or effect.effect_id
+        )
+
+    async def commit(self, effect: StagedEffect) -> dict:
+        label = self._label(effect)
+        if label == self.fail_on:
+            raise RuntimeError(f"downstream rejected {label}")
+        self.committed.append(label)
+        return {"ok": True}
+
+    async def rollback(self, effect: StagedEffect) -> bool:
+        self.rolled_back.append(self._label(effect))
+        return True
+
+
+def _committer_for_all(recorder: RecordingCommitter) -> SideEffectCommitter:
+    committer = SideEffectCommitter()
+    for effect_type in EffectType:
+        committer.register_committer(effect_type, recorder)  # type: ignore[arg-type]
+    return committer
+
+
+class TestExternalApiEffects:
+    """Commit, discard and compensation for EffectType.EXTERNAL_API.
+
+    This is the case a speculative branch most needs held back: a charge or
+    a booking that a losing branch must never dispatch, and that a failed
+    commit can at best compensate rather than undo.
+    """
+
+    @pytest.mark.asyncio()
+    async def test_a_discarded_branch_never_dispatches_the_call(self) -> None:
+        recorder = RecordingCommitter()
+        committer = _committer_for_all(recorder)
+        enclave = Enclave(
+            fork_id="fork:test", option_key="loser", allow_irreversible=True
+        )
+        enclave.stage_external_api("/v1/charges", {"amount_cents": 2500})
+
+        await committer.discard(enclave)
+
+        assert recorder.committed == []
+        assert recorder.rolled_back == []
+        assert enclave.is_discarded is True
+
+    @pytest.mark.asyncio()
+    async def test_commits_after_facts_and_before_messages(self) -> None:
+        recorder = RecordingCommitter()
+        committer = _committer_for_all(recorder)
+        enclave = Enclave(
+            fork_id="fork:test", option_key="winner", allow_irreversible=True
+        )
+        enclave.stage_message("ops", {})
+        enclave.stage_fact("reservation", {})
+        enclave.stage_external_api("/v1/charges")
+
+        result = await committer.commit(enclave)
+
+        assert result.success is True
+        assert recorder.committed == ["reservation", "/v1/charges", "ops"]
+
+    @pytest.mark.asyncio()
+    async def test_irreversible_call_is_not_compensated_on_later_failure(
+        self,
+    ) -> None:
+        """The default: the charge stands, and nothing pretends otherwise.
+
+        Pins the current semantics of the single `reversible` flag -- an
+        effect the gate treats as un-undoable is also one rollback skips.
+        """
+        recorder = RecordingCommitter(fail_on="notify")
+        committer = _committer_for_all(recorder)
+        enclave = Enclave(
+            fork_id="fork:test", option_key="winner", allow_irreversible=True
+        )
+        enclave.stage_external_api("/v1/charges", priority=10)
+        enclave.stage_fact("notify", {}, priority=20)
+
+        result = await committer.commit(enclave)
+
+        assert result.success is False
+        assert recorder.committed == ["/v1/charges"]
+        assert recorder.rolled_back == []
+
+    @pytest.mark.asyncio()
+    async def test_compensable_call_is_rolled_back_on_later_failure(
+        self,
+    ) -> None:
+        """irreversible=False is how a caller asks for the refund path."""
+        recorder = RecordingCommitter(fail_on="notify")
+        committer = _committer_for_all(recorder)
+        enclave = Enclave(fork_id="fork:test", option_key="winner")
+        enclave.stage_external_api(
+            "/v1/charges",
+            {"amount_cents": 2500},
+            irreversible=False,
+            idempotency_key="idem:abc123",
+            priority=10,
+        )
+        enclave.stage_fact("notify", {}, priority=20)
+
+        result = await committer.commit(enclave)
+
+        assert result.success is False
+        assert recorder.committed == ["/v1/charges"]
+        assert recorder.rolled_back == ["/v1/charges"]
+
+    @pytest.mark.asyncio()
+    async def test_compensation_runs_in_reverse_commit_order(self) -> None:
+        recorder = RecordingCommitter(fail_on="boom")
+        committer = _committer_for_all(recorder)
+        enclave = Enclave(fork_id="fork:test", option_key="winner")
+        enclave.stage_fact("reserve", {}, priority=10)
+        enclave.stage_external_api("/v1/charges", irreversible=False, priority=20)
+        enclave.stage_fact("ledger", {}, priority=30)
+        enclave.stage_fact("boom", {}, priority=40)
+
+        result = await committer.commit(enclave)
+
+        assert result.success is False
+        assert recorder.committed == ["reserve", "/v1/charges", "ledger"]
+        assert recorder.rolled_back == ["ledger", "/v1/charges", "reserve"]
