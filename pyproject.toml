@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sm-enclave"
-version = "0.2.0"
+version = "0.3.0"
 description = "Speculative execution sandbox with staged side effects and commit/discard semantics"
 readme = "README.md"
 license = "MIT"

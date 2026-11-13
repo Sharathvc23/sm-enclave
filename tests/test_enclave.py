@@ -112,6 +112,20 @@ class TestEnclave:
             option_key=DEFAULT_OPTION_KEY,
         )
 
+    @pytest.fixture()
+    def permissive_enclave(self) -> Enclave:
+        """An enclave that permits irreversible effects.
+
+        Messages, events and external API calls are irreversible by default
+        and the gate refuses them on a default enclave, so a test whose
+        subject is something other than the gate needs this fixture.
+        """
+        return Enclave(
+            fork_id=DEFAULT_FORK_ID,
+            option_key=DEFAULT_OPTION_KEY,
+            allow_irreversible=True,
+        )
+
     def test_creation(self, enclave: Enclave) -> None:
         """Enclave should initialize correctly."""
         assert enclave.fork_id == DEFAULT_FORK_ID
@@ -137,14 +151,14 @@ class TestEnclave:
         assert effect.effect_type == EffectType.FACT
         assert effect.payload["fact_type"] == "position"
 
-    def test_stage_message(self, enclave: Enclave) -> None:
+    def test_stage_message(self, permissive_enclave: Enclave) -> None:
         """Should stage message effects."""
-        effect_id = enclave.stage_message(
+        effect_id = permissive_enclave.stage_message(
             "recipient:command",
             {"cmd": "execute"},
         )
 
-        effect = enclave.get_effect(effect_id)
+        effect = permissive_enclave.get_effect(effect_id)
         assert effect is not None
         assert effect.effect_type == EffectType.MESSAGE
         assert effect.reversible is False
@@ -198,14 +212,14 @@ class TestEnclave:
         assert effect.effect_type == EffectType.METRIC
         assert effect.payload["value"] == 0.85
 
-    def test_stage_event(self, enclave: Enclave) -> None:
+    def test_stage_event(self, permissive_enclave: Enclave) -> None:
         """Should stage event effects."""
-        effect_id = enclave.stage_event(
+        effect_id = permissive_enclave.stage_event(
             "task.started",
             {"task_id": "t123"},
         )
 
-        effect = enclave.get_effect(effect_id)
+        effect = permissive_enclave.get_effect(effect_id)
         assert effect is not None
         assert effect.effect_type == EffectType.EVENT
 
@@ -237,13 +251,13 @@ class TestEnclave:
         with pytest.raises(RuntimeError, match="at capacity"):
             enclave.stage_fact("overflow", {})
 
-    def test_get_effects_in_priority_order(self, enclave: Enclave) -> None:
+    def test_get_effects_in_priority_order(self, permissive_enclave: Enclave) -> None:
         """Effects should be returned in priority order."""
-        enclave.stage_event("event", {}, priority=400)
-        enclave.stage_fact("fact", {}, priority=100)
-        enclave.stage_command("cmd", {}, irreversible=False, priority=50)
+        permissive_enclave.stage_event("event", {}, priority=400)
+        permissive_enclave.stage_fact("fact", {}, priority=100)
+        permissive_enclave.stage_command("cmd", {}, irreversible=False, priority=50)
 
-        effects = enclave.get_effects()
+        effects = permissive_enclave.get_effects()
 
         assert effects[0].effect_type == EffectType.COMMAND  # priority 50
         assert effects[1].effect_type == EffectType.FACT  # priority 100
@@ -470,3 +484,174 @@ class TestEnclave:
         assert enclave_a.get_local_state("shared_key") == "value_A"
         assert enclave_b.get_local_state("shared_key") == "value_B"
         assert enclave_a.get_local_state("only_in_b") is None
+
+
+class TestIrreversibilityGate:
+    """The gate in _stage_effect, which covers every effect type.
+
+    Before the gate moved there it lived in stage_command alone, so a
+    message or an event -- both irreversible -- reached a default enclave
+    unchecked while the README said they were blocked.
+    """
+
+    @pytest.fixture()
+    def enclave(self) -> Enclave:
+        return Enclave(
+            fork_id=DEFAULT_FORK_ID,
+            option_key=DEFAULT_OPTION_KEY,
+        )
+
+    def test_blocks_irreversible_message(self, enclave: Enclave) -> None:
+        with pytest.raises(ValueError, match="Irreversible message"):
+            enclave.stage_message("ops@example.com", {"body": "shipped"})
+
+    def test_blocks_irreversible_event(self, enclave: Enclave) -> None:
+        with pytest.raises(ValueError, match="Irreversible event"):
+            enclave.stage_event("order.placed", {"order_id": "o1"})
+
+    def test_blocks_irreversible_external_api(self, enclave: Enclave) -> None:
+        with pytest.raises(ValueError, match="Irreversible external_api"):
+            enclave.stage_external_api("/charges", {"amount_cents": 500})
+
+    def test_blocks_irreversible_command(self, enclave: Enclave) -> None:
+        with pytest.raises(ValueError, match="Irreversible command"):
+            enclave.stage_command("charge_card", {"amount_cents": 500})
+
+    def test_nothing_is_staged_when_the_gate_refuses(self, enclave: Enclave) -> None:
+        """A refused effect must leave no trace in the enclave."""
+        for call in (
+            lambda: enclave.stage_message("r", {}),
+            lambda: enclave.stage_event("e", {}),
+            lambda: enclave.stage_external_api("/e", {}),
+            lambda: enclave.stage_command("c", {}),
+        ):
+            with pytest.raises(ValueError):
+                call()
+        assert enclave.effect_count == 0
+        assert enclave.get_execution_log() == []
+
+    def test_gate_precedes_the_sealed_check(self, enclave: Enclave) -> None:
+        """An irreversible effect on a sealed enclave is a ValueError.
+
+        The gate is checked first, so the policy error is reported rather
+        than the sealed RuntimeError. This preserves the precedence
+        stage_command had when it carried the check itself.
+        """
+        enclave.seal()
+        with pytest.raises(ValueError, match="Irreversible command"):
+            enclave.stage_command("charge_card", {})
+
+    def test_sealed_check_still_applies_to_reversible_effects(
+        self, enclave: Enclave
+    ) -> None:
+        enclave.seal()
+        with pytest.raises(RuntimeError, match="sealed"):
+            enclave.stage_fact("position", {})
+
+    @pytest.mark.parametrize(
+        ("call_name", "args"),
+        [
+            ("stage_message", ("r", {})),
+            ("stage_event", ("e", {})),
+            ("stage_external_api", ("/e", {})),
+        ],
+    )
+    def test_opting_out_of_irreversibility_passes_the_gate(
+        self, enclave: Enclave, call_name: str, args: tuple
+    ) -> None:
+        """irreversible=False is the escape hatch for a retractable transport."""
+        effect_id = getattr(enclave, call_name)(*args, irreversible=False)
+        effect = enclave.get_effect(effect_id)
+        assert effect is not None
+        assert effect.reversible is True
+
+    def test_reversible_effects_are_never_gated(self, enclave: Enclave) -> None:
+        enclave.stage_fact("position", {"x": 1})
+        enclave.stage_metric("fuel", 12.5)
+        assert enclave.effect_count == 2
+
+
+class TestStageExternalApi:
+    """stage_external_api -- the effect class for work that leaves the process.
+
+    EffectType.EXTERNAL_API was declared in types.py from the start but had
+    no staging path, so a charge or a booking could not be staged at all.
+    """
+
+    @pytest.fixture()
+    def enclave(self) -> Enclave:
+        return Enclave(
+            fork_id=DEFAULT_FORK_ID,
+            option_key=DEFAULT_OPTION_KEY,
+            allow_irreversible=True,
+        )
+
+    def test_stages_with_external_api_type(self, enclave: Enclave) -> None:
+        effect_id = enclave.stage_external_api("/v1/charges", {"amount_cents": 2500})
+        effect = enclave.get_effect(effect_id)
+        assert effect is not None
+        assert effect.effect_type == EffectType.EXTERNAL_API
+
+    def test_irreversible_by_default(self, enclave: Enclave) -> None:
+        effect = enclave.get_effect(enclave.stage_external_api("/v1/charges"))
+        assert effect is not None
+        assert effect.reversible is False
+
+    def test_payload_shape(self, enclave: Enclave) -> None:
+        effect = enclave.get_effect(
+            enclave.stage_external_api(
+                "/v1/charges",
+                {"amount_cents": 2500},
+                method="POST",
+                idempotency_key="idem:abc123",
+                target_id="stripe",
+            )
+        )
+        assert effect is not None
+        assert effect.payload == {
+            "endpoint": "/v1/charges",
+            "method": "POST",
+            "target_id": "stripe",
+            "params": {"amount_cents": 2500},
+            "idempotency_key": "idem:abc123",
+        }
+
+    def test_params_default_to_empty_dict(self, enclave: Enclave) -> None:
+        effect = enclave.get_effect(enclave.stage_external_api("/v1/ping"))
+        assert effect is not None
+        assert effect.payload["params"] == {}
+        assert effect.payload["idempotency_key"] is None
+
+    def test_params_are_copied_not_aliased(self, enclave: Enclave) -> None:
+        """Mutating the caller's dict after staging must not change the effect."""
+        params = {"amount_cents": 2500}
+        effect = enclave.get_effect(enclave.stage_external_api("/v1/charges", params))
+        params["amount_cents"] = 99999
+        assert effect is not None
+        assert effect.payload["params"] == {"amount_cents": 2500}
+
+    def test_default_priority_sits_between_facts_and_messages(
+        self, enclave: Enclave
+    ) -> None:
+        """Facts (100) commit first, then the call (150), then messages (200)."""
+        enclave.stage_message("ops", {})
+        enclave.stage_fact("reservation", {})
+        enclave.stage_external_api("/v1/charges")
+
+        order = [e.effect_type for e in enclave.get_effects()]
+        assert order == [
+            EffectType.FACT,
+            EffectType.EXTERNAL_API,
+            EffectType.MESSAGE,
+        ]
+
+    def test_explicit_priority_overrides_the_default(self, enclave: Enclave) -> None:
+        enclave.stage_fact("reservation", {}, priority=100)
+        enclave.stage_external_api("/v1/charges", priority=10)
+        assert enclave.get_effects()[0].effect_type == EffectType.EXTERNAL_API
+
+    def test_appears_in_the_execution_log(self, enclave: Enclave) -> None:
+        enclave.stage_external_api("/v1/charges")
+        entry = enclave.get_execution_log()[0]
+        assert entry["action"] == "staged"
+        assert entry["effect_type"] == "external_api"
